@@ -23,7 +23,10 @@ const app = express();
 const cors = require("cors");
 
 const corsOptions = {
-    origin: ["http://localhost:5173"],
+    origin: [
+        "http://localhost:5173",
+        "https://romannico.github.io"
+    ],
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
@@ -847,7 +850,7 @@ app.put("/requerimientos/finalizar/:id", async (req, res) => {
 
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en http://localhost:${PORT}`);
