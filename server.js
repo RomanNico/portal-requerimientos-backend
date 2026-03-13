@@ -598,45 +598,124 @@ async function subirAdjunto(issueKey, archivo) {
         }
     );
 }
+
+const mapaTitulos = {
+
+"descripcion general del requerimiento": { emoji: "📄", titulo: "Descripción general del requerimiento" },
+"descripcion breve de la necesidad": { emoji: "📄", titulo: "Descripción breve de la necesidad" },
+"problema que se busca resolver": { emoji: "⚠️", titulo: "Problema que se busca resolver" },
+"area o proceso impactado": { emoji: "🏢", titulo: "Área o proceso impactado" },
+"usuarios impactados": { emoji: "👥", titulo: "Usuarios impactados" },
+"objetivo de la solucion": { emoji: "🎯", titulo: "Objetivo de la solución" },
+"descripcion del proceso actual": { emoji: "🔍", titulo: "Descripción del proceso actual" },
+"descripcion del proceso esperado": { emoji: "🚀", titulo: "Descripción del proceso esperado" },
+"sistemas involucrados": { emoji: "⚙️", titulo: "Sistemas involucrados" },
+"prioridad asignada": { emoji: "🔥", titulo: "Prioridad asignada" },
+"riesgos": { emoji: "⚠️", titulo: "Riesgos" },
+"dependencias": { emoji: "🔗", titulo: "Dependencias" },
+"criterios de aceptacion": { emoji: "✅", titulo: "Criterios de aceptación" },
+"autor del requerimiento": { emoji: "👤", titulo: "Autor del requerimiento" },
+"centro de costos": { emoji: "🏷️", titulo: "Centro de costos" },
+"adjuntos": { emoji: "📎", titulo: "Adjuntos" },
+"observaciones adicionales": { emoji: "📝", titulo: "Observaciones adicionales" }
+
+};
+
 function convertirATextoADF(texto) {
 
-    const lineas = texto.split("\n").map(l => l.trim()).filter(l => l !== "");
+    if (!texto) {
+        return {
+            type: "doc",
+            version: 1,
+            content: []
+        };
+    }
+
+    /* LIMPIAR HTML DEL FRONTEND */
+    const textoPlano = texto
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .trim();
+
+    const lineas = textoPlano
+        .split("\n")
+        .map(l => l.trim())
+        .filter(l => l !== "");
 
     const contenido = [];
+    let listaActual = [];
+
+    function cerrarLista() {
+        if (listaActual.length > 0) {
+
+            contenido.push({
+                type: "bulletList",
+                content: listaActual.map(item => ({
+                    type: "listItem",
+                    content: [
+                        {
+                            type: "paragraph",
+                            content: [
+                                { type: "text", text: item }
+                            ]
+                        }
+                    ]
+                }))
+            });
+
+            listaActual = [];
+        }
+    }
 
     lineas.forEach(linea => {
 
-        /* TITULOS */
-        if (linea.endsWith(":")) {
+        const textoLower = linea
+            .replace(/[📄⚠️🏢👥🎯🔍🚀⚙️🔥🔗✅👤🏷️📎📝]/g, "")
+            .replace(":", "")
+            .toLowerCase()
+            .trim();
+        /* TITULOS AUTOMATICOS */
+        if (mapaTitulos[textoLower]) {
+
+            cerrarLista();
+
+            const info = mapaTitulos[textoLower];
 
             contenido.push({
                 type: "heading",
                 attrs: { level: 3 },
-                content: [{ type: "text", text: linea.replace(":", "") }]
+                content: [
+                    {
+                        type: "text",
+                        text: `${info.emoji} ${info.titulo}`
+                    }
+                ]
+            });
+
+            /* separador visual */
+            contenido.push({
+                type: "paragraph",
+                content: [{ type: "text", text: " " }]
             });
 
             return;
         }
 
-        /* LISTAS */
-        if (linea.startsWith("–") || linea.startsWith("-")) {
+        /* TITULOS GENERICOS */
+        if (linea.endsWith(":")) {
+
+            cerrarLista();
+
+            const titulo = linea.replace(":", "");
 
             contenido.push({
-                type: "bulletList",
+                type: "heading",
+                attrs: { level: 3 },
                 content: [
                     {
-                        type: "listItem",
-                        content: [
-                            {
-                                type: "paragraph",
-                                content: [
-                                    {
-                                        type: "text",
-                                        text: linea.replace(/^[-–]\s*/, "")
-                                    }
-                                ]
-                            }
-                        ]
+                        type: "text",
+                        text: `📌 ${titulo}`
                     }
                 ]
             });
@@ -644,20 +723,42 @@ function convertirATextoADF(texto) {
             return;
         }
 
-        /* PARRAFOS */
+        /* DETECTAR LISTAS */
+        if (
+            linea.startsWith("–") ||
+            linea.startsWith("-") ||
+            linea.startsWith("•")
+        ) {
+
+            listaActual.push(
+                linea.replace(/^[-–•]\s*/, "")
+            );
+
+            return;
+        }
+
+        cerrarLista();
+
+        /* PARRAFOS NORMALES */
         contenido.push({
             type: "paragraph",
-            content: [{ type: "text", text: linea }]
+            content: [
+                {
+                    type: "text",
+                    text: linea
+                }
+            ]
         });
 
     });
+
+    cerrarLista();
 
     return {
         type: "doc",
         version: 1,
         content: contenido
     };
-
 }
 
 app.post("/crear-jira", async (req, res) => {
@@ -690,13 +791,20 @@ app.post("/crear-jira", async (req, res) => {
 
         const summary = `[MANAGER] ${tipoCaso?.Subject || "REQ"} - ${tipoCaso?.IdByProject || ""}`;
 
-        const textoPlano = textoFinal
-            ?.replace(/<br\s*\/?>/gi, "\n")
-            ?.replace(/<\/p>/gi, "\n")
-            ?.replace(/<[^>]+>/g, "")
-            ?.trim();
+        const datosPlantilla = {
+        textoFinal,
+        tipoCaso,
+        fechaRegistro,
+        centroCosto: customfield_10120
+        };
 
-        const description = convertirATextoADF(textoPlano);
+        console.log("TEXTO RECIBIDO:");
+        console.log(textoFinal);
+
+        const description = convertirATextoADF(textoFinal);
+
+        console.log("ADF GENERADO:");
+        console.log(JSON.stringify(description, null, 2));
 
         /* CREAR ISSUE */
 
