@@ -761,6 +761,77 @@ function convertirATextoADF(texto) {
     };
 }
 
+function normalizarId(texto) {
+    if (!texto) return "";
+
+    return texto
+        .toString()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "") 
+        .trim();
+}
+
+
+async function existeTicketEnJira(idRequerimiento) {
+
+    try {
+
+        if (!idRequerimiento) return false;
+
+        const id = idRequerimiento.trim();
+
+        console.log("🔎 Buscando:", id);
+
+        const jql = `summary ~ "${id}"`;
+
+        const response = await axios.get(
+            "https://comwaredev.atlassian.net/rest/api/3/search/jql",
+            {
+                params: {
+                    jql: jql,
+                    maxResults: 10,
+                    fields: "summary"
+                },
+                auth: {
+                    username: process.env.JIRA_EMAIL,
+                    password: process.env.JIRA_API_TOKEN
+                }
+            }
+        );
+
+        const issues = response.data.issues || [];
+
+        if (issues.length > 0) {
+
+            console.log("⚠️ DUPLICADO DETECTADO");
+
+            issues.forEach(i => {
+                console.log(i.key, "-", i.fields.summary);
+            });
+
+            return true;
+
+        }
+
+        console.log("✅ No existe ticket");
+
+        return false;
+
+    } catch (error) {
+
+        console.error(
+            "❌ Error validando ticket:",
+            error.response?.data || error.message
+        );
+
+        return false;
+
+    }
+
+}
+
+
+
 app.post("/crear-jira", async (req, res) => {
 
     try {
@@ -773,6 +844,20 @@ app.post("/crear-jira", async (req, res) => {
             adjuntos = []
         } = req.body;
 
+        /* VALIDAR DUPLICADO EN JIRA */
+
+        const idRequerimiento = (tipoCaso?.IdByProject || "").trim();
+
+        const yaExiste = await existeTicketEnJira(idRequerimiento);
+
+        if (yaExiste) {
+
+            return res.status(400).json({
+                success: false,
+                error: `El requerimiento ${idRequerimiento} ya existe en Jira`
+            });
+
+        }
 
         console.log("📨 Recibiendo solicitud JIRA...");
         console.log("🏢 Centro costo:", customfield_10120);
@@ -789,7 +874,7 @@ app.post("/crear-jira", async (req, res) => {
             });
         }
 
-        const summary = `[MANAGER] ${tipoCaso?.Subject || "REQ"} - ${tipoCaso?.IdByProject || ""}`;
+        const summary = `PRCWARE - ${tipoCaso?.Subject} - ${tipoCaso?.IdByProject}`;
 
         const datosPlantilla = {
         textoFinal,
