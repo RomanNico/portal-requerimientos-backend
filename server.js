@@ -9,6 +9,20 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const jwkToPem = require("jwk-to-pem");
 const axios = require("axios");
+const dns = require("dns");
+const https = require("https");
+
+// Forzar preferencia de IPv4 para evitar errores de red (ENETUNREACH) en entornos sin IPv6
+if (dns.setDefaultResultOrder) {
+    dns.setDefaultResultOrder("ipv4first");
+}
+
+const ipv4Agent = new https.Agent({ 
+    family: 4,
+    rejectUnauthorized: false // Mantenemos la política de ignorar certificados si es necesario
+});
+
+console.log("[DEBUG] Backend inicializado con preferencia de IPv4 (v1.2)");
 const adjuntosPorThread = {};
 const FormData = require("form-data");
 const path = require("path");
@@ -76,15 +90,33 @@ async function obtenerJwks(tenantId) {
     if (cached && Date.now() < cached.expiresAt) return cached.keysByKid;
 
     const url = `https://login.microsoftonline.com/${key}/discovery/v2.0/keys`;
-    const { data } = await axios.get(url);
-    const keysByKid = data.keys.reduce((acc, jwk) => ({ ...acc, [jwk.kid]: jwk }), {});
+    
+    let attempt = 0;
+    const maxAttempts = 2;
+    
+    while (attempt < maxAttempts) {
+        try {
+            console.log(`[SSO] Obteniendo llaves desde Microsoft (Intento ${attempt + 1})...`);
+            const { data } = await axios.get(url, { 
+                timeout: 10000,
+                httpsAgent: ipv4Agent
+            });
+            const keysByKid = data.keys.reduce((acc, jwk) => ({ ...acc, [jwk.kid]: jwk }), {});
 
-    jwksCacheByTenant.set(key, {
-        keysByKid,
-        expiresAt: Date.now() + 12 * 60 * 60 * 1000
-    });
+            jwksCacheByTenant.set(key, {
+                keysByKid,
+                expiresAt: Date.now() + 12 * 60 * 60 * 1000
+            });
 
-    return keysByKid;
+            return keysByKid;
+        } catch (error) {
+            attempt++;
+            console.error(`[SSO] Error al obtener JWKS (Intento ${attempt}):`, error.message);
+            if (attempt >= maxAttempts) throw error;
+            // Esperar un poco antes de reintentar
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
 }
 
 function isTenantAllowed(tokenTenantId) {
