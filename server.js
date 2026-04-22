@@ -23,7 +23,11 @@ const ipv4Agent = new https.Agent({
 });
 
 console.log("[DEBUG] Backend inicializado con preferencia de IPv4 (v1.2)");
-const adjuntosPorThread = {};
+
+// Variables globales para gestionar adjuntos por conversación (thread) con Nova IA
+// Estructura: { threadId: [ { nombre, tipo, data } ] }
+let adjuntosPorThread = {};
+
 const FormData = require("form-data");
 const path = require("path");
 const fs = require("fs");
@@ -74,16 +78,34 @@ pool.query("SELECT NOW()")
 // ─── SSO AZURE AD ────────────────────────────────────────────────────────
 const jwksCacheByTenant = new Map();
 
+/**
+ * Convierte una cadena Base64URL (con - y _) a un Buffer.
+ * Util para decodificar partes del token JWT.
+ * @param {string} input - Cadena en formato Base64URL
+ * @returns {Buffer} Buffer con los datos decodificados
+ */
 function base64UrlToBuffer(input) {
     const normalized = String(input).replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
     return Buffer.from(padded, "base64");
 }
 
+/**
+ * Decodifica una parte del token JWT (header o payload) de Base64URL a JSON.
+ * @param {string} part - Parte del JWT (header o payload)
+ * @returns {Object} Objeto JSON decodificado
+ */
 function decodeJwtPart(part) {
     return JSON.parse(base64UrlToBuffer(part).toString("utf8"));
 }
 
+/**
+ * Obtiene las llaves públicas (JWKS) de Azure AD para un tenant específico.
+ * Implementa caché en memoria (12 horas) para reducir llamadas a la API de Microsoft.
+ * Reintenta hasta 2 veces en caso de error de red.
+ * @param {string} tenantId - ID del tenant de Azure AD (o 'common')
+ * @returns {Promise<Object>} Mapa de llaves indexado por kid (key ID)
+ */
 async function obtenerJwks(tenantId) {
     const key = tenantId || "common";
     const cached = jwksCacheByTenant.get(key);
@@ -119,6 +141,13 @@ async function obtenerJwks(tenantId) {
     }
 }
 
+/**
+ * Verifica si un tenant de Azure AD está autorizado según la configuración.
+ * Lee la lista de tenants permitidos de AZURE_AD_ALLOWED_TENANTS (coma-separada).
+ * Si no se configura, permite cualquier tenant.
+ * @param {string} tokenTenantId - ID del tenant extraído del token
+ * @returns {boolean} true si el tenant está autorizado
+ */
 function isTenantAllowed(tokenTenantId) {
     const allowed = (process.env.AZURE_AD_ALLOWED_TENANTS || "")
         .split(",")
@@ -131,6 +160,13 @@ function isTenantAllowed(tokenTenantId) {
     return allowed.includes(tokenTenantId);
 }
 
+/**
+ * Valida un token JWT de Azure AD usando las llaves JWKS.
+ * Verifica firma RS256, extrae claims y valida que el tenant esté permitido.
+ * @param {string} token - Token JWT de Azure AD
+ * @returns {Promise<Object>} Payload decodificado y verificado
+ * @throws {Error} Si el token es inválido, el tenant no está autorizado o la firma no coincide
+ */
 async function validarTokenAzure(token) {
     const [headerPart, payloadPart] = token.split(".");
     if (!headerPart || !payloadPart) throw new Error("Token JWT inválido");
@@ -170,8 +206,15 @@ async function validarTokenAzure(token) {
     });
 }
 
-// ─── LOGIN CON SSO  ───────────────────────────────────────────────────────
-// Valida el token Azure AD y retorna el perfil + rol desde usuarios_pgrr
+// ─── LOGIN CON SSO AZURE AD  ────────────────────────────────────────────────
+/**
+ * Endpoint de autenticación SSO con Azure Active Directory.
+ * Valida el token JWT de Azure AD y busca/crea el usuario en la BD local.
+ * Si el usuario no existe en BD, se permite acceso temporal con rol 'user'.
+ * @route POST /sso-login
+ * @header {string} Authorization - Bearer token de Azure AD
+ * @returns {Object} JSON con success, usuario, correo, nombre, rol, cargo, area, oid, centro_costo
+ */
 app.post("/sso-login", async (req, res) => {
 
     const authHeader = req.headers["authorization"] || "";
@@ -261,7 +304,14 @@ app.post("/sso-login", async (req, res) => {
     }
 });
 
-// ─── LOGIN TRADICIONAL (mantenido para compatibilidad) ──────────────────
+/**
+ * Endpoint de autenticación tradicional (usuario/contraseña).
+ * Mantenido por compatibilidad con clientes que no usan SSO.
+ * @route POST /login
+ * @body {string} usuario - Nombre de usuario o correo
+ * @body {string} password - Contraseña en texto plano (se compara con bcrypt)
+ * @returns {Object} JSON con success: boolean
+ */
 app.post("/login", async (req, res) => {
 
     const { usuario, password } = req.body;
@@ -289,6 +339,13 @@ app.post("/login", async (req, res) => {
     }
 });
 
+/**
+ * Obtiene información de perfil de un usuario.
+ * Retorna nombre_usuario, correo, centro_costo, genero y rol.
+ * @route GET /perfil/:usuario
+ * @param {string} usuario - Nombre de usuario o correo
+ * @returns {Object} JSON con success: boolean y usuario: objeto con datos del perfil
+ */
 app.get("/perfil/:usuario", async (req, res) => {
     const { usuario } = req.params;
     try {
@@ -306,6 +363,15 @@ app.get("/perfil/:usuario", async (req, res) => {
     }
 });
 
+/**
+ * Cambia la contraseña de un usuario existente.
+ * Verifica la contraseña actual con bcrypt antes de actualizar.
+ * @route POST /cambiar-password
+ * @body {string} usuario - Nombre de usuario
+ * @body {string} actual - Contraseña actual (texto plano)
+ * @body {string} nueva - Nueva contraseña (se hashea con bcrypt)
+ * @returns {Object} JSON con success: boolean y message si falla
+ */
 app.post("/cambiar-password", async (req, res) => {
     const { usuario, actual, nueva } = req.body;
     try {
@@ -325,40 +391,70 @@ app.post("/cambiar-password", async (req, res) => {
     }
 });
 
+// Token de autenticación para la API de Nova IA y su tiempo de expiración
 let novaToken = null;
 let tokenExpira = 0;
+
+/**
+ * Obtiene o renueva el token de autenticación para Nova IA.
+ * El token se cachea en memoria y se renueva automáticamente cuando caduca.
+ * @returns {Promise<string>} Token de autenticación válido
+ */
 async function obtenerTokenNova() {
     if (novaToken && Date.now() < tokenExpira) return novaToken;
     const { data } = await axios.post("https://api-backend-service.comware.com.co:3026/api/auth/login", {
         username: process.env.NOVA_USER, password: process.env.NOVA_PASS, captcha: "1"
     });
     novaToken = data.token;
-    tokenExpira = Date.now() + (50 * 60 * 1000);
+    tokenExpira = Date.now() + (50 * 60 * 1000); // Token válido por 50 minutos
     return novaToken;
 }
 
+/**
+ * Endpoint para interactuar con Nova IA (asistente virtual).
+ * Recibe mensajes y archivos adjuntos, los almacena temporalmente por thread
+ * y envía la consulta a Nova. Retorna la respuesta y los adjuntos del thread.
+ * @route POST /api/nova
+ */
 app.post("/api/nova", upload.array("files"), async (req, res) => {
     try {
         const { message, threadId, channel = "web" } = req.body;
+
+        // Validar que se proporcione un threadId
         if (!threadId) return res.status(400).json({ error: "threadId es obligatorio" });
+
+        // Inicializar arreglo de adjuntos para este thread si no existe
         if (!adjuntosPorThread[threadId]) adjuntosPorThread[threadId] = [];
+
+        // Agregar archivos recibidos al arreglo de adjuntos del thread
         if (req.files && req.files.length > 0) {
             adjuntosPorThread[threadId].push(...req.files.map(f => ({
-                nombre: f.originalname, tipo: f.mimetype, data: f.buffer.toString("base64")
+                nombre: f.originalname,
+                tipo: f.mimetype,
+                data: f.buffer.toString("base64")
             })));
         }
+
+        // Obtener token de Nova IA
         const token = await obtenerTokenNova();
+
         let reply = "Sin respuesta del asistente.";
+
         try {
-            const { data } = await axios.post("https://api-backend-service.comware.com.co:3026/api/sam-assistant/user-question-bp/4280d8c1-1022-4f44-bd05-d1d5dd3bd66c",
+            // Enviar pregunta a Nova IA usando su API
+            const { data } = await axios.post(
+                "https://api-backend-service.comware.com.co:3026/api/sam-assistant/user-question-bp/4280d8c1-1022-4f44-bd05-d1d5dd3bd66c",
                 { question: message, threadId, channel },
                 { headers: { Authorization: `Bearer ${token}` }, timeout: 60000 }
             );
+
             reply = data.isLastContent || data.reply || data.mensaje || reply;
         } catch (e) {
             console.error("Error Nova:", e.message);
             reply = "⚠️ Nova no respondió, pero los adjuntos fueron recibidos.";
         }
+
+        // Retornar respuesta de Nova y adjuntos acumulados en el thread
         res.json({ reply, adjuntos: adjuntosPorThread[threadId] || [] });
     } catch (error) {
         console.error("ERROR NOVA:", error);
@@ -366,6 +462,15 @@ app.post("/api/nova", upload.array("files"), async (req, res) => {
     }
 });
 
+/**
+ * Obtiene la lista de requerimientos.
+ * Si se pasa el parámetro 'vista=mis' y 'usuario', filtra por autor.
+ * Caso contrario retorna todos los requerimientos ordenados por fecha descendente.
+ * @route GET /requerimientos
+ * @query {string} usuario - Nombre de usuario (opcional, para vista 'mis')
+ * @query {string} vista - Tipo de vista: 'mis' para requerimientos del usuario
+ * @returns {Object} JSON con success: boolean y data: array de requerimientos
+ */
 app.get("/requerimientos", async (req, res) => {
     const { usuario, vista } = req.query;
 
@@ -431,7 +536,13 @@ app.get("/requerimientos", async (req, res) => {
     }
 });
 
-// REQUERIMIENTO POR ID
+/**
+ * Obtiene un requerimiento específico por su ID.
+ * Parsea el campo adjuntos de JSON string a array antes de retornar.
+ * @route GET /requerimientos/:id
+ * @param {string} id - Identificador del requerimiento (ej: REQ_0001)
+ * @returns {Object} JSON con success: boolean y data: objeto requerimiento o false
+ */
 app.get("/requerimientos/:id", async (req, res) => {
     try {
         const result = await pool.query(
@@ -476,7 +587,26 @@ app.get("/requerimientos/:id", async (req, res) => {
     }
 });
 
-// CREAR REQUERIMIENTO
+/**
+ * Crea un nuevo requerimiento en la base de datos.
+ * Genera un ID automáticamente (REQ_0001, REQ_0002, ...) y guarda adjuntos como JSON.
+ * Acepta adjuntos directos o los recupera de adjuntosPorThread (chat Nova).
+ * @route POST /requerimientos
+ * @body {string} titulo - Título del requerimiento
+ * @body {string} autor - Usuario que crea el requerimiento
+ * @body {string} fecha - Fecha de creación (formato ISO)
+ * @body {number} timestamp_ms - Timestamp en milisegundos
+ * @body {string} contenido - Contenido en HTML/ADF del requerimiento
+ * @body {string} [estado="Pendiente"] - Estado inicial
+ * @body {string} prioridad - Prioridad (Alta, Media, Baja)
+ * @body {string} [tipo_caso="Requerimiento"] - Tipo de caso
+ * @body {string} [fecha_solucion] - Fecha estimada de solución
+ * @body {string} [encargado_id] - ID del encargado
+ * @body {string} [centro_costo] - Centro de costos asociado
+ * @body {Array} [adjuntos] - Array de archivos adjuntos
+ * @body {string} [threadId] - ID del thread de Nova (para recuperar adjuntos)
+ * @returns {Object} JSON con success: boolean y id: string del requerimiento creado
+ */
 app.post("/requerimientos", async (req, res) => {
     const {
         titulo,
@@ -551,7 +681,15 @@ app.post("/requerimientos", async (req, res) => {
     }
 });
 
-// ACTUALIZAR ESTADOS DEL REQUERIMIENTO
+/**
+ * Actualiza campos específicos de un requerimiento existente.
+ * Solo actualiza los campos permitidos: estado, comentario, contenido, enviado_jira,
+ * fecha_envio_jira, prioridad.
+ * @route PATCH /requerimientos/:id
+ * @param {string} id - Identificador del requerimiento
+ * @body {Object} campos - Campos a actualizar (solo los permitidos)
+ * @returns {Object} JSON con success: boolean
+ */
 app.patch("/requerimientos/:id", async (req, res) => {
     const { id } = req.params;
     const campos = req.body;
@@ -584,6 +722,18 @@ app.patch("/requerimientos/:id", async (req, res) => {
     }
 });
 
+/**
+ * Endpoint para guardar validaciones PO/QA de un requerimiento.
+ * Actualiza los checks de PO y QA y cambia el estado automáticamente:
+ * - Ambos true → "Listo para enviar"
+ * - Solo uno → "En validación"
+ * - Ninguno → "Pendiente"
+ * @route PATCH /requerimientos/:id/validacion
+ * @param {string} id - Identificador del requerimiento
+ * @body {boolean} po - Aprobación por parte de PO (Product Owner)
+ * @body {boolean} qa - Aprobación por parte de QA (Quality Assurance)
+ * @returns {Object} JSON con success: boolean
+ */
 app.patch("/requerimientos/:id/validacion", async (req, res) => {
     const { id } = req.params;
     const { po, qa } = req.body;
@@ -615,7 +765,12 @@ app.patch("/requerimientos/:id/validacion", async (req, res) => {
     }
 });
 
-// ─── ENVIAR JIRA  ───────────────────────────────────────────────
+// ─── JIRA - GESTIÓN DE SPRINTS Y CAMPOS  ────────────────────────────────────
+
+/**
+ * Obtiene el sprint activo actual en el board de Jira (ID 375).
+ * @returns {Promise<Object>} Datos del sprint activo o null si no hay
+ */
 async function obtenerSprintActivo() {
     const response = await axios.get(
         "https://comwaredev.atlassian.net/rest/agile/1.0/board/375/sprint?state=active",
@@ -633,6 +788,12 @@ async function obtenerSprintActivo() {
     return response.data.values?.[0];
 }
 
+/**
+ * Busca el ID del customfield de centro de costo en Jira.
+ * Consulta las opciones disponibles del campo personalizado customfield_10120.
+ * @param {string} nombreCentro - Nombre del centro de costo a buscar
+ * @returns {Promise<string|null>} ID del centro de costo si se encuentra, null en caso contrario
+ */
 async function obtenerIdCentroCosto(nombreCentro) {
 
     try {
@@ -671,6 +832,11 @@ async function obtenerIdCentroCosto(nombreCentro) {
     }
 }
 
+/**
+ * Sube un archivo adjunto a un issue de Jira existente.
+ * @param {string} issueKey - Clave del issue en Jira (ej: 'PRCWARE-123')
+ * @param {Object} archivo - Objeto con nombre, tipo y data (base64) del archivo
+ */
 async function subirAdjunto(issueKey, archivo) {
     await axios.post(
         `https://comwaredev.atlassian.net/rest/api/3/issue/${issueKey}/attachments`,
@@ -710,6 +876,20 @@ const mapaTitulos = {
 
 };
 
+/**
+ * Convierte texto plano con formato HTML (proveniente del frontend) al formato ADF (Atlassian Document Format).
+ * Detecta títulos automáticos basados en el mapa de secciones, encabezados genéricos, listas y párrafos.
+ * @param {string} texto - Texto HTML o texto plano a convertir
+ * @returns {Object} Documento ADF estructurado con type 'doc', version 1 y array de contenido
+ *
+ * Lógica de conversión:
+ * 1. Limpia etiquetas HTML reemplazando <br> y <p> por saltos de línea
+ * 2. Divide en líneas y procesa cada una
+ * 3. Detecta títulos conocidos usando `mapaTitulos` (descripciones del requerimiento)
+ * 4. Identifica títulos genéricos (líneas que terminan en ":")
+ * 5. Detecta listas (bullet points con –, -, •)
+ * 6. El resto se trata como párrafos normales
+ */
 function convertirATextoADF(texto) {
 
     if (!texto) {
@@ -861,6 +1041,12 @@ function normalizarId(texto) {
 }
 
 
+/**
+ * Verifica si ya existe un ticket en Jira con un ID de requerimiento específico.
+ * Busca en Jira usando JQL (Jira Query Language) por coincidencia en el summary.
+ * @param {string} idRequerimiento - Identificador del requerimiento (ej: REQ_0001)
+ * @returns {Promise<boolean>} true si existe un ticket duplicado, false en caso contrario
+ */
 async function existeTicketEnJira(idRequerimiento) {
 
     try {
@@ -921,6 +1107,23 @@ async function existeTicketEnJira(idRequerimiento) {
 
 
 
+/**
+ * Crea un ticket en Jira a partir de un requerimiento.
+ * Proceso:
+ * 1. Valida que no exista un ticket duplicado (busca por ID en el summary)
+ * 2. Obtiene el sprint activo
+ * 3. Convierte el texto del requerimiento a formato ADF
+ * 4. Crea el issue en Jira con campos personalizados
+ * 5. Sube adjuntos uno por uno (con manejo de errores individuales)
+ *
+ * @route POST /crear-jira
+ * @body {Object} tipoCaso - Metadata del tipo de caso (Subject, IdByProject)
+ * @body {string} textoFinal - Contenido del requerimiento en HTML/ADF
+ * @body {string} fechaRegistro - Fecha de registro del requerimiento
+ * @body {string} customfield_10120 - Centro de costo (puede incluir ID o solo nombre)
+ * @body {Array} [adjuntos=[]] - Array de archivos adjuntos { nombre, tipo, data }
+ * @returns {Object} JSON con success: boolean y issueKey: string del ticket creado
+ */
 app.post("/crear-jira", async (req, res) => {
 
     try {
@@ -1102,7 +1305,14 @@ app.use((err, req, res, next) => {
     });
 });
 
-// REQUERIMIENTO FINALIZADO
+// ─── REQUERIMIENTO FINALIZADO  ───────────────────────────────────────────────
+/**
+ * Marca un requerimiento como finalizado y guarda un comentario opcional.
+ * @route PUT /requerimientos/finalizar/:id
+ * @param {string} id - Identificador del requerimiento
+ * @body {string} comentario - Comentario de cierre (opcional)
+ * @returns {Object} JSON con success: boolean
+ */
 app.put("/requerimientos/finalizar/:id", async (req, res) => {
 
     const { id } = req.params;
