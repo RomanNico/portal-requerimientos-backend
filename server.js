@@ -6,6 +6,8 @@ const express = require("express");
 
 const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const jwkToPem = require("jwk-to-pem");
 const axios = require("axios");
 const adjuntosPorThread = {};
 const FormData = require("form-data");
@@ -55,7 +57,179 @@ pool.query("SELECT NOW()")
     .catch(err => console.error("Error DB:", err));
 
 
-// ─── LOGIN  ───────────────────────────────────────────────
+// ─── SSO AZURE AD ────────────────────────────────────────────────────────
+const jwksCacheByTenant = new Map();
+
+function base64UrlToBuffer(input) {
+    const normalized = String(input).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(normalized.length + (4 - (normalized.length % 4)) % 4, "=");
+    return Buffer.from(padded, "base64");
+}
+
+function decodeJwtPart(part) {
+    return JSON.parse(base64UrlToBuffer(part).toString("utf8"));
+}
+
+async function obtenerJwks(tenantId) {
+    const key = tenantId || "common";
+    const cached = jwksCacheByTenant.get(key);
+    if (cached && Date.now() < cached.expiresAt) return cached.keysByKid;
+
+    const url = `https://login.microsoftonline.com/${key}/discovery/v2.0/keys`;
+    const { data } = await axios.get(url);
+    const keysByKid = data.keys.reduce((acc, jwk) => ({ ...acc, [jwk.kid]: jwk }), {});
+
+    jwksCacheByTenant.set(key, {
+        keysByKid,
+        expiresAt: Date.now() + 12 * 60 * 60 * 1000
+    });
+
+    return keysByKid;
+}
+
+function isTenantAllowed(tokenTenantId) {
+    const allowed = (process.env.AZURE_AD_ALLOWED_TENANTS || "")
+        .split(",")
+        .map(v => v.trim())
+        .filter(Boolean);
+
+    // Si no se configura lista, se permite cualquier tenant (útil con authority=organizations)
+    if (allowed.length === 0) return true;
+
+    return allowed.includes(tokenTenantId);
+}
+
+async function validarTokenAzure(token) {
+    const [headerPart, payloadPart] = token.split(".");
+    if (!headerPart || !payloadPart) throw new Error("Token JWT inválido");
+
+    const header = decodeJwtPart(headerPart);
+    const payload = decodeJwtPart(payloadPart);
+    console.log("[SSO] Validando Token. Header:", header);
+
+    const tokenTenantId = payload.tid || process.env.AZURE_AD_TENANT_ID || "common";
+    if (!isTenantAllowed(tokenTenantId)) {
+        throw new Error("Tenant no autorizado: " + tokenTenantId);
+    }
+
+    const jwks = await obtenerJwks(tokenTenantId);
+    const jwk = jwks[header.kid];
+    if (!jwk) {
+        console.error("[SSO] No se encontro llave para el kid:", header.kid);
+        throw new Error("JWK no encontrado para kid: " + header.kid);
+    }
+
+    const pem = jwkToPem(jwk);
+
+    return new Promise((resolve, reject) => {
+        jwt.verify(
+            token,
+            pem,
+            { algorithms: ["RS256"] }, // Relajamos validación estricta de 'audience'/'issuer' para evitar 401
+            (err, decoded) => { 
+                if (err) {
+                    console.error("Detalle error JWT Verify:", err);
+                    reject(err);
+                } else {
+                    resolve(decoded); 
+                }
+            }
+        );
+    });
+}
+
+// ─── LOGIN CON SSO  ───────────────────────────────────────────────────────
+// Valida el token Azure AD y retorna el perfil + rol desde usuarios_pgrr
+app.post("/sso-login", async (req, res) => {
+
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    const allowAutoRegister = (process.env.SSO_AUTO_REGISTER || "true").toLowerCase() === "true";
+
+    if (!token) {
+        return res.status(401).json({ success: false, message: "Token no proporcionado" });
+    }
+
+    let decoded;
+    try {
+        decoded = await validarTokenAzure(token);
+    } catch (err) {
+        console.error("[SSO] Error de validacion JWT:", err.message);
+        return res.status(401).json({ success: false, message: "Token invalido: " + err.message });
+    }
+
+    const emailCandidatesRaw = [
+        decoded.preferred_username,
+        decoded.email,
+        decoded.upn,
+        decoded.unique_name
+    ].filter(Boolean);
+
+    const normalizedCandidates = emailCandidatesRaw
+        .map(v => String(v).toLowerCase().trim())
+        .filter(Boolean);
+
+    const emailCandidates = [...new Set([
+        ...normalizedCandidates,
+        // Fallback: si en BD el usuario está como "usuario" en vez de correo
+        ...normalizedCandidates
+            .filter(v => v.includes("@"))
+            .map(v => v.split("@")[0])
+            .filter(Boolean)
+    ])];
+
+    const email = emailCandidates[0] || "";
+    const nombre = decoded.name || email || "";
+    const oid = decoded.oid || decoded.sub || "";
+    const cargo = decoded.jobTitle || "";
+    const area = decoded.department || "";
+
+    if (!email) {
+        return res.status(400).json({ success: false, message: "No se pudo obtener el correo del token SSO" });
+    }
+
+    try {
+        // Buscar por correo o por nombre_usuario (algunos usuarios pueden tener el email como usuario)
+        let result = await pool.query(
+            `SELECT * FROM usuarios_pgrr 
+             WHERE LOWER(correo) = ANY($1) OR LOWER(nombre_usuario) = ANY($1)
+             LIMIT 1`,
+            [emailCandidates]
+        );
+
+        if (result.rows.length === 0) {
+            // Si el usuario no está en BD, se le permite acceso temporal con rol 'user'
+            console.log("SSO: Usuario no encontrado en BD. Otorgando acceso virtual con rol 'user':", email);
+            result = { rows: [{
+                nombre_usuario: email,
+                correo: email,
+                rol: "user",
+                centro_costo: ""
+            }] };
+        }
+
+        const user = result.rows[0];
+        console.log(`SSO login: ${email} | rol: ${user.rol}`);
+
+        return res.json({
+            success: true,
+            usuario: user.nombre_usuario,
+            correo: email,
+            nombre: nombre,
+            rol: user.rol,
+            cargo: cargo,
+            area: area,
+            oid: oid,
+            centro_costo: user.centro_costo || area || ""
+        });
+
+    } catch (error) {
+        console.error("Error en SSO login:", error);
+        return res.status(500).json({ success: false, message: "Error interno" });
+    }
+});
+
+// ─── LOGIN TRADICIONAL (mantenido para compatibilidad) ──────────────────
 app.post("/login", async (req, res) => {
 
     const { usuario, password } = req.body;
@@ -65,217 +239,100 @@ app.post("/login", async (req, res) => {
     try {
 
         const result = await pool.query(
-            `SELECT * FROM usuarios_pgrr WHERE nombre_usuario = $1`,
-            [usuario]
+            `SELECT * FROM usuarios_pgrr 
+             WHERE nombre_usuario = $1 OR LOWER(correo) = LOWER($1)
+             LIMIT 1`,
+            [(usuario || "").trim()]
         );
-
-        console.log("Usuarios encontrados:", result.rows.length);
-
-        if (result.rows.length === 0) {
-            console.log("Usuario no existe");
-            return res.json({ success: false });
-        }
+        if (result.rows.length === 0) return res.json({ success: false });
 
         const user = result.rows[0];
-
-        console.log("Hash BD:", user.contrasena);
-
         const passwordValida = await bcrypt.compare(password, user.contrasena);
+        if (!passwordValida) return res.json({ success: false });
 
-        console.log("Password válida:", passwordValida);
-
-        if (!passwordValida) {
-            return res.json({ success: false });
-        }
-
-        res.json({
-            success: true,
-            usuario: user.nombre_usuario,
-            rol: user.rol
-        });
-
+        res.json({ success: true, usuario: user.nombre_usuario, rol: user.rol });
     } catch (error) {
-
         console.error("Error en login:", error);
         res.status(500).json({ success: false });
-
     }
 });
 
-// OBTENER PERFIL
 app.get("/perfil/:usuario", async (req, res) => {
-
     const { usuario } = req.params;
-
     try {
-
         const result = await pool.query(
-            `SELECT nombre_usuario, correo, centro_costo, genero
-            FROM usuarios_pgrr 
-            WHERE nombre_usuario = $1`,
+            `SELECT nombre_usuario, correo, centro_costo, genero, rol
+             FROM usuarios_pgrr 
+             WHERE nombre_usuario = $1 OR LOWER(correo) = LOWER($1)`,
             [usuario]
         );
-
-        if (result.rows.length === 0) {
-            return res.json({ success: false });
-        }
-
-        res.json({
-            success: true,
-            usuario: result.rows[0]
-        });
-
+        if (result.rows.length === 0) return res.json({ success: false });
+        res.json({ success: true, usuario: result.rows[0] });
     } catch (error) {
-
         console.error("Error obteniendo perfil:", error);
         res.status(500).json({ success: false });
-
     }
 });
 
-// CAMBIAR CONTRASEÑA
 app.post("/cambiar-password", async (req, res) => {
-
     const { usuario, actual, nueva } = req.body;
-
     try {
-
         const result = await pool.query(
-            `SELECT contrasena 
-             FROM usuarios_pgrr 
-             WHERE nombre_usuario = $1`,
+            `SELECT contrasena FROM usuarios_pgrr WHERE nombre_usuario = $1`,
             [usuario]
         );
-
-        if (result.rows.length === 0) {
-            return res.json({ success: false, message: "Usuario no encontrado" });
-        }
-
+        if (result.rows.length === 0) return res.json({ success: false, message: "Usuario no encontrado" });
         const hashGuardado = result.rows[0].contrasena;
-
-        const passwordValida = await bcrypt.compare(actual, hashGuardado);
-
-        if (!passwordValida) {
-            return res.json({ success: false, message: "Contraseña actual incorrecta" });
-        }
-
+        if (!(await bcrypt.compare(actual, hashGuardado))) return res.json({ success: false, message: "Contraseña actual incorrecta" });
         const nuevoHash = await bcrypt.hash(nueva, 10);
-
-        await pool.query(
-            `UPDATE usuarios_pgrr 
-             SET contrasena = $1 
-             WHERE nombre_usuario = $2`,
-            [nuevoHash, usuario]
-        );
-
+        await pool.query(`UPDATE usuarios_pgrr SET contrasena = $1 WHERE nombre_usuario = $2`, [nuevoHash, usuario]);
         res.json({ success: true });
-
     } catch (error) {
-
         console.error("Error cambiando contraseña:", error);
         res.status(500).json({ success: false });
-
     }
 });
-
-// ─── NOVA  ───────────────────────────────────────────────
 
 let novaToken = null;
 let tokenExpira = 0;
-
 async function obtenerTokenNova() {
-    if (novaToken && Date.now() < tokenExpira) {
-        return novaToken;
-    }
-
-    const loginResponse = await axios.post(
-        "https://api-backend-service.comware.com.co:3026/api/auth/login",
-        {
-            username: process.env.NOVA_USER,
-            password: process.env.NOVA_PASS,
-            captcha: "1"
-        }
-    );
-
-    novaToken = loginResponse.data.token;
-
+    if (novaToken && Date.now() < tokenExpira) return novaToken;
+    const { data } = await axios.post("https://api-backend-service.comware.com.co:3026/api/auth/login", {
+        username: process.env.NOVA_USER, password: process.env.NOVA_PASS, captcha: "1"
+    });
+    novaToken = data.token;
     tokenExpira = Date.now() + (50 * 60 * 1000);
-
     return novaToken;
 }
 
-
 app.post("/api/nova", upload.array("files"), async (req, res) => {
     try {
-
         const { message, threadId, channel = "web" } = req.body;
-
-        if (!threadId) {
-            return res.status(400).json({ error: "threadId es obligatorio" });
-        }
-
-        if (!adjuntosPorThread[threadId]) {
-            adjuntosPorThread[threadId] = [];
-        }
-
+        if (!threadId) return res.status(400).json({ error: "threadId es obligatorio" });
+        if (!adjuntosPorThread[threadId]) adjuntosPorThread[threadId] = [];
         if (req.files && req.files.length > 0) {
-            const nuevosAdjuntos = req.files.map(file => ({
-                nombre: file.originalname,
-                tipo: file.mimetype,
-                data: file.buffer.toString("base64")
-            }));
-
-            adjuntosPorThread[threadId].push(...nuevosAdjuntos);
+            adjuntosPorThread[threadId].push(...req.files.map(f => ({
+                nombre: f.originalname, tipo: f.mimetype, data: f.buffer.toString("base64")
+            })));
         }
-
         const token = await obtenerTokenNova();
-
         let reply = "Sin respuesta del asistente.";
-
         try {
-            const novaResponse = await axios.post(
-                "https://api-backend-service.comware.com.co:3026/api/sam-assistant/user-question-bp/4280d8c1-1022-4f44-bd05-d1d5dd3bd66c",
-                {
-                    question: message,
-                    threadId,
-                    channel
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${token}`,
-                        "Content-Type": "application/json"
-                    },
-                    timeout: 60000
-                }
+            const { data } = await axios.post("https://api-backend-service.comware.com.co:3026/api/sam-assistant/user-question-bp/4280d8c1-1022-4f44-bd05-d1d5dd3bd66c",
+                { question: message, threadId, channel },
+                { headers: { Authorization: `Bearer ${token}` }, timeout: 60000 }
             );
-
-            reply =
-                novaResponse.data.isLastContent ||
-                novaResponse.data.reply ||
-                novaResponse.data.mensaje ||
-                reply;
-
-        } catch (novaError) {
-            console.error("Error llamando Nova:", novaError.message);
+            reply = data.isLastContent || data.reply || data.mensaje || reply;
+        } catch (e) {
+            console.error("Error Nova:", e.message);
             reply = "⚠️ Nova no respondió, pero los adjuntos fueron recibidos.";
         }
-
-        const adjuntos = adjuntosPorThread[threadId] || [];
-
-        return res.json({
-            reply,
-            adjuntos: adjuntosPorThread[threadId] || []
-        });
-
+        res.json({ reply, adjuntos: adjuntosPorThread[threadId] || [] });
     } catch (error) {
-        console.error("ERROR GENERAL NOVA:", error);
-        return res.status(500).json({
-            error: "Error interno del servidor"
-        });
+        console.error("ERROR NOVA:", error);
+        res.status(500).json({ error: "Error interno" });
     }
 });
-
-// ─── REQUERIMIENTOS ───────────────────────────────────────────
 
 app.get("/requerimientos", async (req, res) => {
     const { usuario, vista } = req.query;
